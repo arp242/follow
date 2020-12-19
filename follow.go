@@ -3,6 +3,7 @@ package follow
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -49,7 +50,7 @@ func (f Follower) Stop() {
 }
 
 // Start following a file for changes.
-func (f Follower) Start(file string) error {
+func (f Follower) Start(ctx context.Context, file string) error {
 	var err error
 	f.file, err = filepath.Abs(file)
 	if err != nil {
@@ -68,7 +69,7 @@ func (f Follower) Start(file string) error {
 	}
 
 	// Watch the directory rather than the file; there doesn't seem to be any
-	// event send when removing a file (on my Linux system, anyway).
+	// event sent when removing a file (on my Linux system, anyway).
 	// TODO: add support for multiple files; we need to be a bit smart about now
 	// watching the same dir twice.
 	err = w.Add(filepath.Dir(f.file))
@@ -77,25 +78,33 @@ func (f Follower) Start(file string) error {
 	}
 
 	go func() {
-		for {
-			f.mainloop(w)
+		for f.mainloop(ctx, w) {
 		}
 	}()
 
-	return <-f.stop
+	s := <-f.stop
+	f.Data <- Data{Err: io.EOF}
+	return s
 }
 
-func (f *Follower) mainloop(w *fsnotify.Watcher) {
+func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		if err != nil && err != context.Canceled {
+			f.Data <- Data{Err: err}
+		}
+		f.stop <- nil
+		return false
 	case err, ok := <-w.Errors:
 		if !ok {
-			return
+			return true
 		}
 		f.Data <- Data{Err: err}
 
 	case e, ok := <-w.Events:
 		if !ok || e.Name != f.file {
-			return
+			return true
 		}
 
 		if e.Op&fsnotify.Write == fsnotify.Write {
@@ -104,7 +113,7 @@ func (f *Follower) mainloop(w *fsnotify.Watcher) {
 				if f.split != nil {
 					f.scanner.Split(f.split)
 				}
-				return
+				return true
 			}
 
 			// We trim the null bytes here as the whole file-truncation
@@ -150,6 +159,7 @@ func (f *Follower) mainloop(w *fsnotify.Watcher) {
 			}
 		}
 	}
+	return true
 }
 
 func (f *Follower) openFile(reopen bool) error {
