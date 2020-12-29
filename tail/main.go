@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"zgo.at/follow"
 )
@@ -15,13 +19,27 @@ func main() {
 	}
 
 	f := follow.New()
-	go func() { log.Fatal(f.Start(os.Args[1])) }()
+
+	// Maximum time to retry opening the file after it goes away; -1 to keep
+	// trying forever.
+	f.Retry = -1
+
+	// Install signal handler; any signal sent to this will reopen the file; you
+	// can send something manually with:
+	//    f.Reopen <- os.Interrupt
+	signal.Notify(f.Reopen, syscall.SIGHUP)
+
+	// Keep reading data in the background, sending it to the f.Data channel.
+	go func() { log.Fatal(f.Start(context.Background(), os.Args[1])) }()
 
 	for {
 		data := <-f.Data
 		if data.Err != nil {
+			if data.Err == io.EOF {
+				break
+			}
 			log.Fatal(data.Err)
 		}
-		fmt.Println(data)
+		fmt.Println("X", data)
 	}
 }

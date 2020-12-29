@@ -1,13 +1,14 @@
 package follow
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -21,36 +22,43 @@ type Data struct {
 func (d Data) String() string { return string(d.Bytes) }
 
 type Follower struct {
-	Data chan Data
+	Data   chan Data      // Data read from the file.
+	Ready  chan struct{}  // Closed if everything is set up.
+	Reopen chan os.Signal // Send signal to reopen file.
 
-	file    string
-	split   bufio.SplitFunc
-	fp      *os.File
-	scanner *bufio.Scanner
-	stop    chan error
+	// Retry opening the file if it disappears for this period; this will
+	// attempt to open the file every second.
+	//
+	// Default is 2s; set to -1 to retry forever.
+	Retry time.Duration
+
+	file string
+	fp   *os.File
+	fpMu *sync.Mutex
+	stop chan error
 }
 
 func New() Follower {
 	return Follower{
-		Data: make(chan Data),
-		stop: make(chan error),
+		Ready:  make(chan struct{}),
+		Data:   make(chan Data),
+		Reopen: make(chan os.Signal, 1),
+		Retry:  2 * time.Second,
+		stop:   make(chan error),
+		fpMu:   new(sync.Mutex),
 	}
-}
-
-// Split sets the bufio.Scanner split function.
-func (f *Follower) Split(split bufio.SplitFunc) {
-	f.split = split
 }
 
 // Stop following a file for changes.
 func (f Follower) Stop() {
 	f.stop <- nil
+	f.fpMu.Lock()
 	f.fp = nil
-	f.scanner = nil
+	f.fpMu.Unlock()
 }
 
 // Start following a file for changes.
-func (f Follower) Start(ctx context.Context, file string) error {
+func (f *Follower) Start(ctx context.Context, file string) error {
 	var err error
 	f.file, err = filepath.Abs(file)
 	if err != nil {
@@ -77,14 +85,51 @@ func (f Follower) Start(ctx context.Context, file string) error {
 		return err
 	}
 
+	// Keep reading until we get a stop signal from mainloop.
 	go func() {
 		for f.mainloop(ctx, w) {
 		}
 	}()
 
+	close(f.Ready)
 	s := <-f.stop
 	f.Data <- Data{Err: io.EOF}
 	return s
+}
+
+// Note: callers should lock!
+func (f *Follower) openFile(reopen bool) error {
+	fp, err := os.Open(f.file)
+	if err != nil {
+		return err
+	}
+
+	if f.fp != nil {
+		*f.fp = *fp
+	} else {
+		f.fp = fp
+	}
+
+	if !reopen {
+		_, err := f.fp.Seek(0, io.SeekEnd)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *Follower) reopen() error {
+	f.fpMu.Lock()
+	defer f.fpMu.Unlock()
+
+	f.fp.Close()
+	err := f.openFile(false)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
@@ -96,89 +141,114 @@ func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 		}
 		f.stop <- nil
 		return false
+
 	case err, ok := <-w.Errors:
 		if !ok {
 			return true
 		}
 		f.Data <- Data{Err: err}
 
+	case <-f.Reopen:
+		err := f.reopen()
+		if err != nil {
+			f.Data <- Data{Err: err}
+		}
+
 	case e, ok := <-w.Events:
+		// Since we read the directory this event may be for another file.
 		if !ok || e.Name != f.file {
 			return true
 		}
 
+		// Write event; read as much data as we can, split it in lines, and send
+		// it over the channel.
 		if e.Op&fsnotify.Write == fsnotify.Write {
-			if !f.scanner.Scan() { // io.EOF: file probably got truncated.
-				f.scanner = bufio.NewScanner(f.fp)
-				if f.split != nil {
-					f.scanner.Split(f.split)
+			f.fpMu.Lock()
+			d, err := ioutil.ReadAll(f.fp)
+			if err != nil {
+				f.Data <- Data{Err: err}
+			}
+
+			// We didn't read any data, the file may have been truncated. This
+			// is not easy to detect since it appears as just a "WRITE" event.
+			if len(d) == 0 {
+				cur, _ := f.fp.Seek(0, io.SeekCurrent)
+				end, _ := f.fp.Seek(0, io.SeekEnd)
+
+				// Seek cursor is past the end of the file, which means it got
+				// smaller and (probably) truncated. Seek to the start and read
+				// again.
+				if cur > end {
+					f.fp.Seek(0, io.SeekStart)
+					d, err = ioutil.ReadAll(f.fp)
+					if err != nil {
+						f.Data <- Data{Err: err}
+					}
+				} else {
+					f.fp.Seek(cur, io.SeekStart)
 				}
-				return true
 			}
 
-			// We trim the null bytes here as the whole file-truncation
-			// thing is messy; sometimes (far from always!) it reads at
-			// the wrong offset the the result is filled with null
-			// bytes. I tried a bunch of different things to improve on
-			// this, but that only made it worse :-/
-			// tl;dr: don't truncate files that are in use.
-			f.Data <- Data{
-				Bytes: bytes.TrimLeft(f.scanner.Bytes(), "\x00"),
-				Err:   f.scanner.Err(),
-			}
+			s := bytes.Split(d, []byte{'\n'})
 
-			for f.scanner.Scan() {
-				f.Data <- Data{Bytes: f.scanner.Bytes(), Err: f.scanner.Err()}
+			// If the last bit of data doesn't end with a newline then seek back
+			// so we read it again on the next write event.
+			if len(s[len(s)-1]) != 0 {
+				seek := len(s[len(s)-1])
+				f.fp.Seek(int64(-seek), io.SeekCurrent)
 			}
+			f.fpMu.Unlock()
+			s = s[:len(s)-1]
 
-			// We need to create a new scanner, as it'll always return false
-			// after it's "done".
-			f.scanner = bufio.NewScanner(f.fp)
-			if f.split != nil {
-				f.scanner.Split(f.split)
+			for _, ss := range s {
+				f.Data <- Data{Bytes: ss}
 			}
 		}
 
-		// File got deleted or moved; attempt to re-open.
+		// File got deleted or moved; attempt to reopen.
 		if e.Op&fsnotify.Remove == fsnotify.Remove || e.Op&fsnotify.Rename == fsnotify.Rename {
+			if f.Retry == 0 {
+				f.Data <- Data{Err: errors.New("follow: file went away")}
+				f.Stop()
+				return false
+			}
+
+			f.fpMu.Lock()
+			defer f.fpMu.Unlock()
 			f.fp.Close()
 
-			// It may take a bit of time before the new file is created
-			// in cases of rename + create.
-			var gotit bool
-			for i := 0; i < 50; i++ { // Try for 500ms
+			// Try a few times with a very short sleep; most of the time this is
+			// something like Vim writing to the file; we don't need to wait a
+			// full second for that.
+			for i := 0; i < 10; i++ {
 				err := f.openFile(true)
 				if err == nil {
-					gotit = true
-					break
+					return true
 				}
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(25 * time.Millisecond)
 			}
-			if !gotit {
-				f.Data <- Data{Err: errors.New("follow: file went away and can't reopen")}
+
+			wait := f.Retry
+			forever := f.Retry == -1
+			for {
+				if !forever {
+					if wait <= 0 {
+						break
+					}
+					wait -= 1 * time.Second
+				}
+
+				time.Sleep(1 * time.Second)
+
+				err := f.openFile(true)
+				if err == nil {
+					return true
+				}
 			}
+			f.Data <- Data{Err: errors.New("follow: file went away and can't reopen")}
+			f.Stop()
+			return false
 		}
 	}
 	return true
-}
-
-func (f *Follower) openFile(reopen bool) error {
-	var err error
-	f.fp, err = os.Open(f.file)
-	if err != nil {
-		return err
-	}
-
-	if !reopen {
-		_, err := f.fp.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
-	}
-
-	f.scanner = bufio.NewScanner(f.fp)
-	if f.split != nil {
-		f.scanner.Split(f.split)
-	}
-	return nil
 }
