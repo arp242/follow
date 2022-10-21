@@ -1,5 +1,5 @@
 module zgo.at/follow
 
-go 1.13
+go 1.16
 
-require github.com/fsnotify/fsnotify v1.4.9
+require github.com/fsnotify/fsnotify v1.6.0
