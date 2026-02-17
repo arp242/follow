@@ -1,6 +1,6 @@
 Go library to follow a file for changes; e.g. "tail -F".
 
-There's a little example application in [`tail/main.go`](/tail/main.go):
+There's a little example application in [`cmd/tail/main.go`](/cmd/tail/main.go):
 
 ```go
 func main() {

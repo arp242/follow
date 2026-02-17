@@ -222,7 +222,7 @@ func TestFollow(t *testing.T) {
 }
 
 func repeatSlice(s string, n int) (r []string) {
-	for i := 0; i < n; i++ {
+	for range n {
 		r = append(r, s)
 	}
 	return r

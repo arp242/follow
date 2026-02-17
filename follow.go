@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,7 +49,7 @@ func New() Follower {
 }
 
 // Stop following a file for changes.
-func (f Follower) Stop() {
+func (f *Follower) Stop() {
 	f.stop <- nil
 	f.fpMu.Lock()
 	f.fp = nil
@@ -162,9 +161,9 @@ func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 
 		// Write event; read as much data as we can, split it in lines, and send
 		// it over the channel.
-		if e.Op&fsnotify.Write == fsnotify.Write {
+		if e.Has(fsnotify.Write) {
 			f.fpMu.Lock()
-			d, err := ioutil.ReadAll(f.fp)
+			d, err := io.ReadAll(f.fp)
 			if err != nil {
 				f.Data <- Data{Err: err}
 			}
@@ -180,7 +179,7 @@ func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 				// again.
 				if cur > end {
 					f.fp.Seek(0, io.SeekStart)
-					d, err = ioutil.ReadAll(f.fp)
+					d, err = io.ReadAll(f.fp)
 					if err != nil {
 						f.Data <- Data{Err: err}
 					}
@@ -206,7 +205,7 @@ func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 		}
 
 		// File got deleted or moved; attempt to reopen.
-		if e.Op&fsnotify.Remove == fsnotify.Remove || e.Op&fsnotify.Rename == fsnotify.Rename {
+		if e.Has(fsnotify.Remove) || e.Has(fsnotify.Rename) {
 			if f.Retry == 0 {
 				f.Data <- Data{Err: errors.New("follow: file went away")}
 				f.Stop()
@@ -220,7 +219,7 @@ func (f *Follower) mainloop(ctx context.Context, w *fsnotify.Watcher) bool {
 			// Try a few times with a very short sleep; most of the time this is
 			// something like Vim writing to the file; we don't need to wait a
 			// full second for that.
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				err := f.openFile(true)
 				if err == nil {
 					return true
